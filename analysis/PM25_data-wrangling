@@ -1,0 +1,226 @@
+# 01_PM25_data-wrangling.R
+#------------------------------------------------------------------------------#
+#                     Air pollution - data wrangling                           #
+#                                                                              #
+# This script wrangles hourly PM25 concentrations data for Mexico City         #
+# Metropolitan Area (2003-2023).                                               #
+#                                                                              #
+# Source:                                                                      #
+# - Instituto Nacional de Ecología y Cambio Climático de México (INECC)        #
+#   http://scica.inecc.gob.mx                                                  #
+# - Gobierno de la Ciudad de México (2023)                                     #
+#   http://www.aire.cdmx.gob.mx/default.php                                    #
+#                                                                              #
+# Authors:                                                                     #
+#   Valeria Gracia Olvera, <vgracia@stanford.edu>.                             #
+#                                                                              #
+# Created: 05/13/24                                                            #
+# Last update: 06/10/24                                                        #
+#------------------------------------------------------------------------------#
+
+rm(list = ls())  # clean environment
+
+# Load libraries and functions --------------------------------------------
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(viridis)
+library(tidyverse)
+library(dtplyr)
+library(data.table)
+
+# Function
+source("R/number_ticks.R")
+
+# Load data ---------------------------------------------------------------
+v_years <- 2003:2023
+n_years <- length(v_years)
+
+# Get PM 2.5 data from ground monitoring stations (2003-2022)
+list_data <- vector(mode = "list", length = n_years)
+names(list_data) <- paste0(v_years)
+for(year_i in v_years[-n_years]){ # year_i = 2003
+  
+  i <- which(v_years == year_i)
+  
+  df_temp <- readxl::read_xls(paste0("data_raw/PM25_data_INECC/CMX-PM25-",year_i,".xls"))
+  
+  list_data[[i]] <- df_temp %>% 
+    mutate(Year = year_i) %>% 
+    relocate(Year, .before = Fecha)
+}
+
+# 2023
+df_2023 <- data.frame(NULL)
+for(k in 1:12){ # k = 8
+  
+  if(k<10){
+    date_column <- rep(seq.Date(from = as.Date(paste0("2023-0",k,"-01")), 
+                                to = as.Date(paste0("2023-0",k,"-",days_in_month(k))),by = "day"), 
+                       each = 24)
+  }else{
+    date_column <- rep(seq.Date(from = as.Date(paste0("2023-",k,"-01")), 
+                                to = as.Date(paste0("2023-",k,"-",days_in_month(k))),by = "day"), 
+                       each = 24)
+  }
+  
+  df_temp <- readxl::read_xls(paste0("data_raw/PM25_data_INECC/2023/PM25_2023_",k,".xls"),
+                              col_types = c("date", rep("numeric", 40)))
+  
+  df_temp <- df_temp %>% 
+    select(-Fecha)
+  
+  df_temp$Fecha <- ""
+  df_temp$Fecha <- as_datetime(date_column)
+  df_temp <- df_temp %>% 
+    relocate(Fecha) %>% 
+    mutate(Year = 2023) %>% 
+    relocate(Year, .before = Fecha)
+  
+  df_2023 <- rbind(df_2023, df_temp)
+}
+
+list_data[["2023"]] <- df_2023
+
+v_colnames <- c()
+for(i in seq_along(v_years)){
+  v_colnames <- c(v_colnames, colnames(list_data[[i]]))
+}
+
+v_colnames <- unique(v_colnames)
+list_data_final <- vector(mode = "list", length = n_years)
+for(i in seq_along(v_years)){ # i = 3
+  
+  v_names_temp <- v_colnames[!(v_colnames %in% colnames(list_data[[i]]))]
+  data_frame <- as.data.frame(matrix(NA,
+                                     ncol = length(v_names_temp),
+                                     nrow = (dim(list_data[[i]]))[1]))
+  colnames(data_frame) <- v_names_temp
+  
+  list_data_final[[i]] <- cbind.data.frame(list_data[[i]], data_frame)
+  
+}
+
+# Bind PM2.5 data in one data.frame
+df_conc_pm25 <- data.frame(NULL)
+for(year_i in v_years){ # year_i = 2003
+  i <- which(v_years == year_i)
+  df_conc_pm25 <- rbind.data.frame(df_conc_pm25, list_data_final[[i]])
+}
+
+df_conc_pm25_stations <- df_conc_pm25 %>%
+  mutate(day = day(Fecha),
+         month = month(Fecha)) %>%
+  relocate(day, month, Year, .after= Fecha) %>%
+  rename(date = Fecha,
+         hour = Hora,
+         year = Year)
+
+df_conc_pm25_stations$date <- as.Date(df_conc_pm25_stations$date)
+
+# Long format
+df_conc_pm25_long <- df_conc_pm25_stations %>% 
+  pivot_longer(cols      = 6:ncol(df_conc_pm25_stations),
+               values_to = "value", 
+               names_to  = "station") %>% 
+  arrange(station, date, day, month, year) 
+
+# Convert to data.table for easy computation
+dt_conc <- as.data.table(df_conc_pm25_long)
+dt_conc[!is.na(value), .count := .N, by = c("date","day","month","year","station")]
+
+# Interpolate missing values (approx)
+# Filter 12 hours or more
+dt_conc_temp <- dt_conc[.count >= 12 & .count < 24, ]
+table(dt_conc_temp$.count)
+
+dt_conc_input <- data.table(NULL)
+for(date_i in unique(dt_conc_temp$date)){ # date_i = "2008-01-01"
+  for(station_i in unique(dt_conc_temp$station)){ # station_i = "ACO"
+    
+    date_iter <- as.Date(date_i)
+    dt_conc_temp_i <- dt_conc_temp[date == date_iter & station == station_i, ]
+    
+    x_temp <- dt_conc_temp_i$hour
+    count_i <- unique(dt_conc_temp_i$.count)
+    if(length(x_temp) == 0) next
+    
+    y_temp <- dt_conc_temp_i$value
+    x_out <- c(1:24)[!(c(1:24) %in% x_temp)]
+    y_out <- approx(x = x_temp, y = y_temp, xout = x_out)$y
+    
+    dt_conc_input <- rbind(dt_conc_input,
+                           dt_conc_temp_i %>% mutate(type = "data"),
+                           data.table(date = date_iter,
+                                      day = day(date_iter),
+                                      month = month(date_iter),
+                                      year = as.numeric(year(date_iter)),
+                                      hour = x_out,
+                                      station = station_i,
+                                      value = y_out,
+                                      .count = count_i,
+                                      type = "interpolation"))
+  }
+}
+
+dt_conc_input[!is.na(value), .count2 := .N, by = c("date","day","month","year","station")]
+table(dt_conc_input$.count)
+table(dt_conc_input$.count2)
+
+dt_conc_input <- dt_conc_input %>% 
+  arrange(station, date, hour)
+
+save(dt_conc_input, file = "data/dt_conc_input_PM25.rda")
+
+# Summarize: as in the NOM-025 to compute the daily average
+df_conc_pm25_sum_day <- dt_conc_input %>% 
+  filter(!is.na(value) & year %in% v_years &
+           .count2 >= 0.75*24) %>%  # at least 75% of hourly observations
+  group_by(date, station) %>% 
+  summarise(mean_day = mean(value)) %>% 
+  ungroup() %>% 
+  group_by(week = cut(date, "week"), station) %>% 
+  mutate(.count_week = length(mean_day)) %>% 
+  ungroup() %>% 
+  filter(.count_week > 1) %>% 
+  group_by(week, station) %>% 
+  summarise(mean_week = mean(mean_day)) %>% 
+  ungroup() %>% 
+  filter(mean_week > 1) # outliers
+
+df_conc_pm25_sum_day$week <- as.Date(df_conc_pm25_sum_day$week) 
+
+df_conc_PM25 <- df_conc_pm25_sum_day %>% 
+  mutate(pollutant = "PM25",
+         month = lubridate::month(week),
+         year = lubridate::year(week),
+         Season = case_when(month %in% c(12,1,2) ~ "Winter",
+                            month %in% c(3,4,5) ~ "Spring",
+                            month %in% c(6,7,8) ~ "Summer",
+                            month %in% c(9,10,11) ~ "Fall")) %>% 
+  relocate(pollutant)
+
+# Plot
+ggplot(df_conc_PM25, 
+       aes(x = week, y = mean_week, color = station)) +
+  # geom_line() + geom_point() +
+  geom_bar(stat = "identity") +
+  facet_wrap(~ station, ncol = 6) +
+  scale_x_date(date_labels = "%Y") +
+  xlab("") + ylab("Concentration (µg/m3)") +
+  theme_bw(base_size = 16) +
+  theme(axis.text.x = element_text(angle = 60,
+                                   hjust = 0.5,
+                                   vjust = 0.5),
+        panel.background = element_rect(fill = "white"),
+        strip.background = element_rect(fill = "white",colour = "white"),
+        legend.position = "none")
+
+ggsave("figs/fig_PM25_trends_by_station.jpg",
+       width = 12, height = 12)
+
+# Save data
+df_conc_PM25 <- df_conc_PM25 %>% 
+  arrange(pollutant, week, station)
+
+save(df_conc_PM25, file = "data/df_conc_PM25.rda")
